@@ -23,7 +23,7 @@ jobs:
           FEISHU_SECRET: ${{ secrets.FEISHU_SECRET }}
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
         run: |
-          python feishu_marketing_daily/daily_marketing_bot.py \
+          python daily_marketing_bot.py \
             --timezone Asia/Shanghai \
             --lookback-hours 30 \
             --max-items 10

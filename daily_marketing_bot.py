@@ -262,6 +262,32 @@ def summarize_item(item: dict[str, Any], max_len: int = 180) -> str:
     return summary[: max_len - 3].rstrip() + "..."
 
 
+def parse_json_array_from_text(text: str) -> list[dict[str, Any]]:
+    content = (text or "").strip()
+    if not content:
+        return []
+
+    if content.startswith("```"):
+        content = re.sub(r"^```(?:json)?\s*", "", content, flags=re.IGNORECASE)
+        content = re.sub(r"\s*```$", "", content)
+
+    try:
+        parsed = json.loads(content)
+        return parsed if isinstance(parsed, list) else []
+    except json.JSONDecodeError:
+        pass
+
+    start = content.find("[")
+    end = content.rfind("]")
+    if start >= 0 and end > start:
+        try:
+            parsed = json.loads(content[start : end + 1])
+            return parsed if isinstance(parsed, list) else []
+        except json.JSONDecodeError:
+            return []
+    return []
+
+
 def deepseek_enhance_items(items: list[dict[str, Any]], model: str = DEFAULT_DEEPSEEK_MODEL) -> None:
     api_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
     if not api_key or not items:
@@ -274,24 +300,30 @@ def deepseek_enhance_items(items: list[dict[str, Any]], model: str = DEFAULT_DEE
                 "idx": idx,
                 "source": item.get("source", ""),
                 "title": item.get("title", ""),
-                "summary": summarize_item(item, max_len=240),
+                "summary": summarize_item(item, max_len=280),
             }
         )
 
     prompt = (
-        "You are a senior marketing analyst. Convert each item into concise Simplified Chinese.\n"
-        "Return strict JSON array only. Each element must contain: idx, zh_summary.\n"
-        "zh_summary must be <= 70 Chinese chars and focus on brand/marketing implications.\n"
+        "你是资深品牌营销分析师。请基于以下英文资讯，输出简体中文解读。\n"
+        "只返回 JSON 数组，每个元素包含字段：idx, zh_title, key_points, impact。\n"
+        "约束：\n"
+        "- zh_title: 中文标题，<=26字。\n"
+        "- key_points: 2-3条要点数组，每条<=38字。\n"
+        "- impact: 影响意义，1-2句，<=80字，聚焦品牌/营销层面的决策启发。\n"
+        "- 不要输出数组以外任何文字。\n"
         f"items={json.dumps(compact_items, ensure_ascii=False)}"
     )
+
     payload = {
         "model": model,
         "messages": [
-            {"role": "system", "content": "Output valid JSON only."},
+            {"role": "system", "content": "你输出严格有效的 JSON，不要 markdown。"},
             {"role": "user", "content": prompt},
         ],
         "temperature": 0.2,
     }
+
     req = urllib.request.Request(
         "https://api.deepseek.com/v1/chat/completions",
         data=json.dumps(payload).encode("utf-8"),
@@ -301,22 +333,46 @@ def deepseek_enhance_items(items: list[dict[str, Any]], model: str = DEFAULT_DEE
         },
         method="POST",
     )
+
     try:
         with urllib.request.urlopen(req, timeout=45) as resp:
             body = json.loads(resp.read().decode("utf-8", errors="ignore"))
+
         content = body["choices"][0]["message"]["content"].strip()
-        parsed = json.loads(content)
-        by_idx = {int(x["idx"]): str(x.get("zh_summary", "")).strip() for x in parsed}
+        parsed = parse_json_array_from_text(content)
+
+        by_idx: dict[int, dict[str, Any]] = {}
+        for row in parsed:
+            try:
+                row_idx = int(row.get("idx"))
+            except Exception:
+                continue
+            by_idx[row_idx] = row
+
         for idx, item in enumerate(items, 1):
-            zh = by_idx.get(idx, "")
-            if zh:
-                item["zh_summary"] = zh
+            row = by_idx.get(idx, {})
+            zh_title = str(row.get("zh_title", "")).strip()
+            impact = str(row.get("impact", "")).strip()
+            points = row.get("key_points", [])
+
+            cleaned_points: list[str] = []
+            if isinstance(points, list):
+                cleaned_points = [str(p).strip() for p in points if str(p).strip()]
+
+            if zh_title:
+                item["zh_title"] = zh_title
+            if cleaned_points:
+                item["zh_points"] = cleaned_points[:3]
+            if impact:
+                item["impact"] = impact
+
     except Exception as exc:
         print(f"[warn] deepseek enhance skipped: {exc}")
 
 
 def build_feishu_payload(items: list[dict[str, Any]], report_date: str) -> dict[str, Any]:
     rows: list[list[dict[str, str]]] = []
+
     if not items:
         rows.append(
             [
@@ -328,7 +384,7 @@ def build_feishu_payload(items: list[dict[str, Any]], report_date: str) -> dict[
         )
     else:
         for idx, item in enumerate(items, 1):
-            title = item["title"].strip()
+            title = item.get("zh_title") or item["title"].strip()
             source = item["source"]
             published = item.get("published")
             published_text = (
@@ -336,12 +392,28 @@ def build_feishu_payload(items: list[dict[str, Any]], report_date: str) -> dict[
                 if isinstance(published, datetime)
                 else "unknown time"
             )
-            brief = item.get("zh_summary", "") or summarize_item(item)
-            line = f"{idx}. [{source}] {title}\n{brief}\n{published_text}"
+
+            points = item.get("zh_points")
+            if isinstance(points, list) and points:
+                points_text = "\n".join([f"- {p}" for p in points[:3]])
+            else:
+                points_text = f"- {summarize_item(item)}"
+
+            impact = (
+                item.get("impact")
+                or "该动态可能影响品牌预算配置、渠道策略或创意方向，建议结合业务目标快速评估。"
+            )
+
+            line = (
+                f"{idx}. [{source}] {title}\n"
+                f"摘要要点：\n{points_text}\n"
+                f"影响意义：{impact}\n"
+                f"时间：{published_text}"
+            )
             rows.append(
                 [
                     {"tag": "text", "text": line + "\n"},
-                    {"tag": "a", "text": "Read", "href": item["link"]},
+                    {"tag": "a", "text": "查看原文", "href": item["link"]},
                 ]
             )
 
@@ -405,9 +477,12 @@ def run_once(args: argparse.Namespace, state: dict[str, Any]) -> int:
     new_items = [it for it in results if it["link"] not in sent_links]
     picked = new_items[: args.max_items]
 
+    deepseek_enhance_items(picked, model=args.deepseek_model)
+
     print(f"[info] collected={len(results)}, new={len(new_items)}, picked={len(picked)}")
     for idx, item in enumerate(picked, 1):
-        print(f"{idx}. [{item['source']}] {item['title']}")
+        shown_title = item.get("zh_title") or item["title"]
+        print(f"{idx}. [{item['source']}] {shown_title}")
         print(f"   {item['link']}")
 
     if args.dry_run:
@@ -420,7 +495,6 @@ def run_once(args: argparse.Namespace, state: dict[str, Any]) -> int:
 
     tz = resolve_timezone(args.timezone)
     report_date = datetime.now(tz).strftime("%Y-%m-%d")
-    deepseek_enhance_items(picked, model=args.deepseek_model)
     payload = build_feishu_payload(picked, report_date=report_date)
 
     secret = os.environ.get("FEISHU_SECRET", "").strip()
